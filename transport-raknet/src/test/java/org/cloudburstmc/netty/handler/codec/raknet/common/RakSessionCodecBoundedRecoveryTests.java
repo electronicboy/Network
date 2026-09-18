@@ -24,6 +24,7 @@ import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
+import io.netty.util.concurrent.ScheduledFuture;
 import org.cloudburstmc.netty.channel.raknet.RakChannel;
 import org.cloudburstmc.netty.channel.raknet.RakDisconnectReason;
 import org.cloudburstmc.netty.channel.raknet.RakPriority;
@@ -57,9 +58,211 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.cloudburstmc.netty.channel.raknet.RakConstants.ID_DISCONNECTION_NOTIFICATION;
+import static org.cloudburstmc.netty.channel.raknet.RakConstants.FLAG_VALID;
+import static org.cloudburstmc.netty.channel.raknet.RakConstants.FLAG_ACK;
+import static org.cloudburstmc.netty.channel.raknet.RakConstants.FLAG_NACK;
 
 public class RakSessionCodecBoundedRecoveryTests {
     private static final int MTU = 1_200;
+
+    @Test
+    public void immediateMessagesWithCapacitySendInTheSameMillisecond() throws Exception {
+        AtomicLong clock = new AtomicLong(100L);
+        Harness harness = harness(clock, null);
+        try {
+            writeApplication(harness, 100, RakPriority.IMMEDIATE);
+            releaseOutbound(harness.channel, 1);
+            writeApplication(harness, 100, RakPriority.IMMEDIATE);
+            releaseOutbound(harness.channel, 1);
+            Assertions.assertEquals(0, get(harness.codec, "queuedBytes"));
+            Assertions.assertNull(get(harness.codec, "sendFuture"));
+        } finally {
+            harness.close();
+        }
+    }
+
+    @Test
+    public void explicitFlushesWithCapacitySendInTheSameMillisecond() throws Exception {
+        AtomicLong clock = new AtomicLong(100L);
+        Harness harness = harness(clock, null);
+        try {
+            for (int i = 0; i < 2; i++) {
+                writeApplication(harness, 100, RakPriority.NORMAL);
+                Assertions.assertNull(harness.channel.readOutbound());
+                harness.codec.flush(harness.context);
+                releaseOutbound(harness.channel, 1);
+            }
+        } finally {
+            harness.close();
+        }
+    }
+
+    @Test
+    public void pacingResumesAtAvailableCreditWithoutWaitingForMaintenance() throws Exception {
+        AtomicLong clock = new AtomicLong(100L);
+        Harness harness = harness(clock, null);
+        harness.channel.freezeTime();
+        try {
+            writeApplication(harness, 1_100, RakPriority.IMMEDIATE);
+            writeApplication(harness, 1_100, RakPriority.IMMEDIATE);
+            releaseOutbound(harness.channel, 2);
+            writeApplication(harness, 1_100, RakPriority.IMMEDIATE);
+            Assertions.assertNull(harness.channel.readOutbound(), "exhausted pacing credit still bounds the burst");
+            ScheduledFuture<?> wakeup = (ScheduledFuture<?>) get(harness.codec, "sendFuture");
+            Assertions.assertNotNull(wakeup);
+            Assertions.assertEquals(1_000_000L, wakeup.getDelay(TimeUnit.NANOSECONDS));
+
+            harness.channel.advanceTimeBy(999, TimeUnit.MICROSECONDS);
+            harness.channel.runScheduledPendingTasks();
+            Assertions.assertNull(harness.channel.readOutbound(), "credit is not borrowed before it is available");
+            clock.incrementAndGet();
+            harness.channel.advanceTimeBy(1, TimeUnit.MICROSECONDS);
+            harness.channel.runScheduledPendingTasks();
+            releaseOutbound(harness.channel, 1);
+            Assertions.assertEquals(0, get(harness.codec, "queuedBytes"));
+            Assertions.assertNull(get(harness.codec, "sendFuture"), "a drained sender retains no pacing task");
+        } finally {
+            harness.close();
+        }
+    }
+
+    @Test
+    public void ackImmediatelyResumesAlreadyFlushedTrafficWithoutPollingFullWindow() throws Exception {
+        AtomicLong clock = new AtomicLong();
+        Harness harness = harness(clock, null);
+        List<TestDatagram> occupyingWindow = new ArrayList<>();
+        try {
+            for (int i = 0; i < 11; i++) {
+                TestDatagram datagram = datagram(1_100, i);
+                occupyingWindow.add(datagram);
+                harness.add(datagram.packet);
+            }
+            set(harness.codec, "datagramWriteIndex", 11);
+            set(harness.codec, "datagramSendOrdinal", 11L);
+            harness.arm();
+            clock.set(10L);
+            writeApplication(harness, 100, RakPriority.IMMEDIATE);
+            Assertions.assertNull(harness.channel.readOutbound());
+            Assertions.assertNull(get(harness.codec, "sendFuture"), "window blockage waits for ACKs without polling");
+
+            receiveAcknowledgement(harness, 0, false);
+            releaseOutbound(harness.channel, 1);
+            Assertions.assertEquals(0, get(harness.codec, "queuedBytes"));
+        } finally {
+            harness.close();
+            for (TestDatagram datagram : occupyingWindow) {
+                releaseIfNeeded(datagram.payload);
+            }
+        }
+    }
+
+    @Test
+    public void nackWithCapacityRetransmitsDuringAcknowledgementHandling() throws Exception {
+        AtomicLong clock = new AtomicLong();
+        Harness harness = harness(clock, null);
+        TestDatagram lost = datagram(100, 0);
+        try {
+            harness.add(lost.packet);
+            harness.arm();
+            clock.set(10L);
+            receiveAcknowledgement(harness, 0, true);
+            Assertions.assertEquals(1, lost.packet.getRetransmissionCount());
+            releaseOutbound(harness.channel, 1);
+            Assertions.assertTrue(harness.pending.isEmpty());
+        } finally {
+            harness.close();
+            releaseIfNeeded(lost.payload);
+        }
+    }
+
+    @Test
+    public void ackDoesNotFlushAnApplicationBatchBeforeItsSendRequest() throws Exception {
+        AtomicLong clock = new AtomicLong();
+        Harness harness = harness(clock, null);
+        TestDatagram previous = datagram(100, 0);
+        try {
+            harness.add(previous.packet);
+            clock.set(10L);
+            writeApplication(harness, 100, RakPriority.NORMAL);
+            receiveAcknowledgement(harness, 0, false);
+            Assertions.assertNull(harness.channel.readOutbound());
+            Assertions.assertNull(get(harness.codec, "sendFuture"));
+            harness.codec.flush(harness.context);
+            releaseOutbound(harness.channel, 1);
+        } finally {
+            harness.close();
+            releaseIfNeeded(previous.payload);
+        }
+    }
+
+    @Test
+    public void newSendOpportunityCancelsObsoletePacingWakeup() throws Exception {
+        AtomicLong clock = new AtomicLong(100L);
+        Harness harness = harness(clock, null);
+        harness.channel.freezeTime();
+        try {
+            for (int i = 0; i < 3; i++) {
+                writeApplication(harness, 1_100, RakPriority.IMMEDIATE);
+            }
+            releaseOutbound(harness.channel, 2);
+            ScheduledFuture<?> wakeup = (ScheduledFuture<?>) get(harness.codec, "sendFuture");
+            Assertions.assertNotNull(wakeup);
+            clock.incrementAndGet();
+            writeApplication(harness, 100, RakPriority.IMMEDIATE);
+            releaseOutbound(harness.channel, 2);
+            Assertions.assertTrue(wakeup.isCancelled());
+            Assertions.assertNull(get(harness.codec, "sendFuture"));
+            harness.channel.advanceTimeBy(1, TimeUnit.MILLISECONDS);
+            harness.channel.runScheduledPendingTasks();
+            Assertions.assertNull(harness.channel.readOutbound());
+        } finally {
+            harness.close();
+        }
+    }
+
+    @Test
+    public void closeCancelsPacingWakeupAndReleasesQueuedPayload() throws Exception {
+        AtomicLong clock = new AtomicLong(100L);
+        Harness harness = harness(clock, null);
+        harness.channel.freezeTime();
+        ByteBuf queued = null;
+        try {
+            writeApplication(harness, 1_100, RakPriority.IMMEDIATE);
+            writeApplication(harness, 1_100, RakPriority.IMMEDIATE);
+            releaseOutbound(harness.channel, 2);
+            queued = writeApplication(harness, 1_100, RakPriority.IMMEDIATE);
+            ScheduledFuture<?> wakeup = (ScheduledFuture<?>) get(harness.codec, "sendFuture");
+            Assertions.assertNotNull(wakeup);
+            harness.closeCodec();
+            Assertions.assertTrue(wakeup.isCancelled());
+            Assertions.assertEquals(0, queued.refCnt());
+            clock.incrementAndGet();
+            harness.channel.advanceTimeBy(1, TimeUnit.MILLISECONDS);
+            harness.channel.runScheduledPendingTasks();
+            Assertions.assertNull(harness.channel.readOutbound());
+        } finally {
+            harness.close();
+            if (queued != null) {
+                releaseIfNeeded(queued);
+            }
+        }
+    }
+
+    private static ByteBuf writeApplication(Harness harness, int bytes, RakPriority priority) {
+        ByteBuf payload = Unpooled.buffer(bytes).writeByte(0x42).writeZero(bytes - 1);
+        harness.codec.write(harness.context, new RakMessage(payload, RakReliability.RELIABLE, priority),
+                harness.context.newPromise());
+        return payload;
+    }
+
+    private static void receiveAcknowledgement(Harness harness, int sequence, boolean nack) {
+        if (harness.channel.pipeline().get(RakAcknowledgeHandler.class) == null) {
+            harness.channel.pipeline().addFirst(new RakAcknowledgeHandler(harness.codec));
+        }
+        ByteBuf acknowledgement = Unpooled.buffer(7).writeByte(FLAG_VALID | (nack ? FLAG_NACK : FLAG_ACK))
+                .writeShort(1).writeBoolean(true).writeMediumLE(sequence);
+        harness.channel.writeInbound(acknowledgement);
+    }
 
     @Test
     public void queueTelemetryIncludesParentHandoffAndSaturatesSafely() {

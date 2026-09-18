@@ -63,6 +63,16 @@ ordered, so that path is the performance focus. Unreliable datagrams still
 share model accounting and pacing to prevent a congestion-control bypass, but
 no new unreliable-message scheduling or deadline API is implied.
 
+Send requests use available window and pacing credit immediately, including
+multiple `IMMEDIATE` writes or explicit manual flushes in the same millisecond.
+ACK processing resumes previously flushed traffic as soon as the window opens;
+NACK processing immediately attempts bounded retransmission. If pacing credit
+is exhausted, one cancellable event-loop wakeup resumes sending at the first
+eligible millisecond instead of waiting for the periodic flush. A full window
+waits for ACK progress without polling. Configured application batching remains
+unchanged, and all these send opportunities share the same congestion and
+pacing accounting.
+
 Model snapshots also expose cumulative hard-loss and delay-qualified
 loss-response counts. These are monotonic for the lifetime of one session and
 count actual congestion-window reductions, not raw loss reports. The extended

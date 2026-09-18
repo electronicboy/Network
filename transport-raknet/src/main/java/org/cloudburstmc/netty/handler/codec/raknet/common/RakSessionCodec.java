@@ -22,6 +22,7 @@ import io.netty.channel.*;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
+import io.netty.util.concurrent.ScheduledFuture;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import org.cloudburstmc.netty.channel.raknet.*;
@@ -57,11 +58,12 @@ public class RakSessionCodec extends ChannelDuplexHandler {
     private final RakChannel channel;
     private final LongSupplier clock;
     private RakSessionTicker.Registration tickRegistration;
+    private ScheduledFuture<?> sendFuture;
+    private boolean flushPending;
 
     private volatile RakState state;
 
     private volatile long lastTouched;
-    private volatile long lastFlush;
 
     // Reliability, Ordering, Sequencing and datagram indexes
     private RakSlidingWindow slidingWindow;
@@ -175,6 +177,8 @@ public class RakSessionCodec extends ChannelDuplexHandler {
     }
 
     private void closeSession() {
+        this.cancelScheduledSend();
+        this.flushPending = false;
         if (this.state == RakState.DISCONNECTED && this.tickRegistration == null) {
             // Already deinitialized
             return;
@@ -626,7 +630,7 @@ public class RakSessionCodec extends ChannelDuplexHandler {
             this.write(ctx, new RakMessage(buffer, RakReliability.UNRELIABLE, RakPriority.IMMEDIATE), ctx.voidPromise());
         }
 
-         this.internalFlush(ctx);
+        this.internalFlush(ctx);
     }
 
     static int totalQueuedBytes(int sessionQueuedBytes, int handoffQueuedBytes) {
@@ -635,11 +639,8 @@ public class RakSessionCodec extends ChannelDuplexHandler {
     }
 
     private void internalFlush(ChannelHandlerContext ctx) {
+        this.cancelScheduledSend();
         long curTime = this.currentTimeMillis();
-        if (this.lastFlush == curTime) {
-            return; // do not flush multiple times within one ms
-        }
-        this.lastFlush = curTime;
 
         this.handleIncomingAcknowledge(ctx, curTime, this.incomingAcks, false);
         this.handleIncomingAcknowledge(ctx, curTime, this.incomingNaks, true);
@@ -681,12 +682,72 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         // Finally flush channel
         ctx.flush();
 
+        this.flushPending = !this.outgoingPackets.isEmpty() || !this.pendingRetransmissions.isEmpty();
+        this.scheduleNextSend(ctx);
+
         RakChannelMetrics metrics = this.getMetrics();
         if (metrics != null) {
             metrics.nackOut(writtenNacks);
             metrics.ackOut(writtenAcks);
             metrics.rakStaleDatagrams(resendCount);
             this.recoveryMetrics.reportState(metrics, this.slidingWindow, curTime);
+        }
+    }
+
+    void onAcknowledge() {
+        if (this.state != RakState.CONNECTED) {
+            return;
+        }
+        ChannelHandlerContext ctx = this.ctx();
+        long curTime = this.currentTimeMillis();
+        this.handleIncomingAcknowledge(ctx, curTime, this.incomingAcks, false);
+        this.handleIncomingAcknowledge(ctx, curTime, this.incomingNaks, true);
+        if (this.flushPending || !this.pendingRetransmissions.isEmpty()) {
+            // ACK progress and explicit loss requests are send opportunities, not work for the next tick.
+            this.internalFlush(ctx);
+        }
+    }
+
+    private void scheduleNextSend(ChannelHandlerContext ctx) {
+        int size;
+        PendingRetransmission pending = this.pendingRetransmissions.peek();
+        if (pending != null) {
+            RakDatagramPacket datagram = this.sentDatagrams.get(pending.sequenceIndex);
+            if (datagram == null) {
+                return;
+            }
+            size = datagram.getSize();
+        } else {
+            EncapsulatedPacket packet = this.outgoingPackets.peek();
+            if (packet == null || this.slidingWindow.isModelPersistentCongestion()) {
+                return;
+            }
+            size = packet.getSize() + RAKNET_DATAGRAM_HEADER_SIZE;
+        }
+        long delay = this.slidingWindow.getSendDelayMillis(this.currentTimeMillis(), size);
+        if (delay < 0L) {
+            return;
+        }
+        // Keep one wakeup for already-flushed traffic, at the first millisecond with enough pacing credit.
+        // A zero delay yields bounded recovery work to the event loop without adding a timer interval.
+        this.sendFuture = ctx.executor().schedule(() -> {
+            this.sendFuture = null;
+            if (this.state != RakState.CONNECTED) {
+                return;
+            }
+            try {
+                this.internalFlush(ctx);
+            } catch (Throwable throwable) {
+                log.error("[{}] Error resuming RakNet send", this.getRemoteAddress(), throwable);
+                this.channel.close();
+            }
+        }, delay, TimeUnit.MILLISECONDS);
+    }
+
+    private void cancelScheduledSend() {
+        if (this.sendFuture != null) {
+            this.sendFuture.cancel(false);
+            this.sendFuture = null;
         }
     }
 

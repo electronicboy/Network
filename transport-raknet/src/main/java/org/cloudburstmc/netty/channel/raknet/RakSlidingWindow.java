@@ -78,6 +78,13 @@ public class RakSlidingWindow {
         }
     }
 
+    /** Returns the pacing wait for a datagram, or {@code -1} when ACK progress must first open the window. */
+    public long getSendDelayMillis(long curTime, int size) {
+        long delay = this.modelController.sendDelayMillis(curTime, this.congestionControlledBytesInFlight(), size);
+        this.cwnd = this.modelController.getCongestionWindow();
+        return delay;
+    }
+
     public void onPacketReceived(long curTime) {
         if (this.oldestUnsentAck == 0) {
             this.oldestUnsentAck = curTime;

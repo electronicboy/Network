@@ -178,6 +178,17 @@ final class RakModelCongestionController {
         return size <= this.transmissionAllowance(nowMillis, bytesInFlight);
     }
 
+    long sendDelayMillis(long nowMillis, int bytesInFlight, int size) {
+        if (size <= this.transmissionAllowance(nowMillis, bytesInFlight)) {
+            return 0L;
+        }
+        if (size > this.cwnd - bytesInFlight) {
+            // Only delivery progress can open the window; do not poll a blocked peer.
+            return -1L;
+        }
+        return Math.max(1L, (long) Math.ceil((size - this.pacingTokens) / this.pacingRateBytesPerMillis()));
+    }
+
     void onPacketSent(RakDatagramPacket datagram, long nowMillis, int bytesInFlight, boolean appLimited) {
         this.refillPacingTokens(nowMillis);
         this.pacingTokens = Math.max(0D, this.pacingTokens - datagram.getSize());
