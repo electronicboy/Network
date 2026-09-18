@@ -1,0 +1,53 @@
+name: Deploy GitHub Packages
+
+on:
+  push:
+    branches:
+      - 'shane/nethernet/raknet-recovery'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    # Upstream publishes to OSSRH/OpenCollab; this flow is for forks only.
+    if: github.repository != 'CloudburstMC/Network'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Validate Gradle Wrapper
+        uses: gradle/wrapper-validation-action@v1
+      - name: Compute branch snapshot version
+        id: version
+        shell: bash
+        run: |
+          base_version="$(sed -n 's/^version=//p' gradle.properties)"
+          base_version="${base_version%-SNAPSHOT}"
+          if [ -z "$base_version" ]; then
+            echo "::error::Could not read project version from gradle.properties"
+            exit 1
+          fi
+
+          branch_name="${GITHUB_REF_NAME//\//-}"
+          branch_name="${branch_name//[^A-Za-z0-9._-]/-}"
+          # GitHub Packages refuses to overwrite an already published release
+          # version, so every push has to land as a snapshot.
+          publish_version="${base_version}-${branch_name}-SNAPSHOT"
+
+          echo "publish-version=${publish_version}" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${publish_version}"
+      - name: Publish
+        uses: gradle/gradle-build-action@v2
+        with:
+          gradle-version: wrapper
+          arguments: "publish"
+        env:
+          MAVEN_DEPLOY_URL: "https://maven.pkg.github.com/${{ github.repository }}"
+          MAVEN_DEPLOY_USERNAME: ${{ github.actor }}
+          MAVEN_DEPLOY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          NETWORK_PUBLISH_VERSION: ${{ steps.version.outputs.publish-version }}
