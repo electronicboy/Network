@@ -24,6 +24,15 @@ public interface RakChannel extends Channel {
 
     ChannelPipeline rakPipeline();
 
+    /**
+     * Returns payload bytes waiting to enter the RakNet session pipeline.
+     *
+     * @return pending payload bytes, or zero when the channel does not require a cross-event-loop handoff
+     */
+    default int pendingRakNetOutboundBytes() {
+        return 0;
+    }
+
     @Override
     RakChannelConfig config();
 }

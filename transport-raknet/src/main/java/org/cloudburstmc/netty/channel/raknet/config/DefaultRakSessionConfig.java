@@ -57,7 +57,8 @@ public class DefaultRakSessionConfig extends DefaultChannelConfig implements Rak
                 super.getOptions(),
                 RakChannelOption.RAK_GUID, RakChannelOption.RAK_MAX_CHANNELS, RakChannelOption.RAK_MTU, RakChannelOption.RAK_PROTOCOL_VERSION, RakChannelOption.RAK_ORDERING_CHANNELS,
                 RakChannelOption.RAK_METRICS, RakChannelOption.RAK_SESSION_TIMEOUT, RakChannelOption.RAK_AUTO_FLUSH, RakChannelOption.RAK_FLUSH_INTERVAL,
-                RakChannelOption.RAK_MAX_QUEUED_BYTES, RakChannelOption.RAK_MAX_SPLIT_QUEUED_BYTES, RakChannelOption.RAK_MAX_ORDERING_QUEUED_BYTES);
+                RakChannelOption.RAK_MAX_QUEUED_BYTES, RakChannelOption.RAK_MAX_SPLIT_QUEUED_BYTES,
+                RakChannelOption.RAK_MAX_ORDERING_QUEUED_BYTES);
     }
 
     @SuppressWarnings("unchecked")

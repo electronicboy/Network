@@ -46,6 +46,15 @@ public class RakUnhandledMessagesQueue extends SimpleChannelInboundHandler<Encap
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+        this.closeQueue();
+    }
+
+    /** Releases queued messages after the owning event loop has already terminated. */
+    public void closeAfterEventLoopTermination() {
+        this.closeQueue();
+    }
+
+    private void closeQueue() {
         if (this.future != null) {
             this.future.cancel(false);
             this.future = null;

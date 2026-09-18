@@ -42,7 +42,9 @@ import org.cloudburstmc.netty.util.RakUtils;
 
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.util.ArrayList;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -53,6 +55,7 @@ public class RakServerChannel extends ProxyChannel<DatagramChannel> implements S
 
     private final RakServerChannelConfig config;
     private final Map<SocketAddress, RakChildChannel> childChannelMap = new ConcurrentHashMap<>();
+    private final Set<RakChildChannel> childrenPendingCleanup = ConcurrentHashMap.newKeySet();
     private final Consumer<RakChannel> childConsumer;
 
     private boolean pipelineInitialized;
@@ -127,6 +130,10 @@ public class RakServerChannel extends ProxyChannel<DatagramChannel> implements S
         }
 
         RakChildChannel channel = new RakChildChannel(address, localAddress, clientAddress, this, clientGuid, mtu, childConsumer);
+        // A cookie-authenticated replacement displaces the old address mapping before its asynchronous close
+        // cleanup necessarily reaches the parent loop. Keep cleanup ownership independent of address identity so
+        // parent shutdown can wait for both the replacement and every displaced child.
+        this.childrenPendingCleanup.add(channel);
         channel.closeFuture().addListener((GenericFutureListener<ChannelFuture>) this::onChildClosed);
         // Set before fireChannelRead because initChannel runs async on the child worker thread.
         if (protocolVersion != 0) {
@@ -149,21 +156,114 @@ public class RakServerChannel extends ProxyChannel<DatagramChannel> implements S
 
     private void onChildClosed(ChannelFuture channelFuture) {
         RakChildChannel channel = (RakChildChannel) channelFuture.channel();
-        this.childChannelMap.remove(channel.remoteOrProxyAddress());
+        if (!this.eventLoop().inEventLoop()) {
+            // Serialize teardown after the child's terminal parent-handoff drain. This prevents a retained message
+            // already owned by the parent event loop from entering a pipeline destroyed on the child event loop.
+            try {
+                this.eventLoop().execute(() -> this.finishChildCloseAndComplete(channel));
+            } catch (Throwable throwable) {
+                // Rejection means the parent loop is terminating. Its termination is the final ownership fence for
+                // any drain task that was already running when the child closed. Parent-backed pipeline events can
+                // no longer be scheduled, so release the two stateful handlers directly after that fence.
+                this.eventLoop().terminationFuture().addListener(ignored ->
+                        this.finishChildCloseAfterParentTermination(channel, throwable));
+            }
+            return;
+        }
+        this.finishChildCloseAndComplete(channel);
+    }
+
+    private void finishChildCloseAndComplete(RakChildChannel channel) {
+        Throwable failure = null;
+        try {
+            failure = this.finishChildClose(channel);
+            if (failure != null) {
+                log.error("Failed to clean up RakNet child {}", channel.remoteAddress(), failure);
+            }
+        } catch (Throwable unexpected) {
+            failure = unexpected;
+            log.error("Unexpected failure cleaning up RakNet child {}", channel.remoteAddress(), unexpected);
+        } finally {
+            // Completed-before-remove is the ordering guarantee used by onCloseTriggered: a parent snapshot either
+            // observes this child and its promise, or observes that cleanup has already completed.
+            try {
+                channel.completeParentCleanup(failure);
+            } finally {
+                this.childrenPendingCleanup.remove(channel);
+            }
+        }
+    }
+
+    private Throwable finishChildClose(RakChildChannel channel) {
+        Throwable failure = null;
+        this.childChannelMap.remove(channel.remoteOrProxyAddress(), channel);
 
         if (this.config().getMetrics() != null) {
-            this.config().getMetrics().channelClose(channel.remoteAddress());
+            try {
+                this.config().getMetrics().channelClose(channel.remoteAddress());
+            } catch (Throwable throwable) {
+                failure = appendFailure(failure, throwable);
+            }
         }
 
-        channel.rakPipeline().fireChannelInactive();
-        channel.rakPipeline().fireChannelUnregistered();
-        // Need to use reflection to destroy pipeline because
-        // DefaultChannelPipeline.destroy() is only called when channel.isOpen() is false,
-        // but the method is called on parent channel, and there is no other way to destroy pipeline.
-        RakUtils.destroyChannelPipeline(channel.rakPipeline());
+        try {
+            channel.rakPipeline().fireChannelInactive();
+        } catch (Throwable throwable) {
+            failure = appendFailure(failure, throwable);
+        }
+        try {
+            channel.rakPipeline().fireChannelUnregistered();
+        } catch (Throwable throwable) {
+            failure = appendFailure(failure, throwable);
+        }
+        try {
+            // Need to use reflection to destroy pipeline because
+            // DefaultChannelPipeline.destroy() is only called when channel.isOpen() is false,
+            // but the method is called on parent channel, and there is no other way to destroy pipeline.
+            RakUtils.destroyChannelPipeline(channel.rakPipeline());
+        } catch (Throwable throwable) {
+            failure = appendFailure(failure, throwable);
+        }
 
         if (this.config().getThrottle() != null) {
-            this.config().getThrottle().closed(channel.remoteAddress());
+            try {
+                this.config().getThrottle().closed(channel.remoteAddress());
+            } catch (Throwable throwable) {
+                failure = appendFailure(failure, throwable);
+            }
+        }
+        return failure;
+    }
+
+    private void finishChildCloseAfterParentTermination(RakChildChannel channel, Throwable schedulingFailure) {
+        Throwable failure = schedulingFailure;
+        this.childChannelMap.remove(channel.remoteOrProxyAddress(), channel);
+        try {
+            channel.releaseRakNetResourcesAfterParentTermination();
+        } catch (Throwable throwable) {
+            failure = appendFailure(failure, throwable);
+        }
+        if (this.config().getMetrics() != null) {
+            try {
+                this.config().getMetrics().channelClose(channel.remoteAddress());
+            } catch (Throwable throwable) {
+                failure = appendFailure(failure, throwable);
+            }
+        }
+        if (this.config().getThrottle() != null) {
+            try {
+                this.config().getThrottle().closed(channel.remoteAddress());
+            } catch (Throwable throwable) {
+                failure = appendFailure(failure, throwable);
+            }
+        }
+        if (failure != schedulingFailure || failure.getSuppressed().length > 0) {
+            log.error("Failed terminal RakNet child cleanup for {}", channel.remoteAddress(), failure);
+        }
+        try {
+            channel.completeParentCleanup(failure);
+        } finally {
+            this.childrenPendingCleanup.remove(channel);
         }
     }
 
@@ -173,11 +273,24 @@ public class RakServerChannel extends ProxyChannel<DatagramChannel> implements S
             log.trace("Closing RakServerChannel: {}", Thread.currentThread().getName(), new Throwable());
         }
         PromiseCombiner combiner = new PromiseCombiner(this.eventLoop());
-        this.childChannelMap.values().forEach(channel -> combiner.add(channel.close()));
+        // The parent-backed session pipeline must be inactive and destroyed before the parent event loop is allowed
+        // to terminate. Waiting only for each child closeFuture leaves that cleanup task behind on the parent tail.
+        new ArrayList<>(this.childrenPendingCleanup).forEach(channel -> {
+            combiner.add(channel.parentCleanupFuture());
+            channel.close();
+        });
 
         ChannelPromise combinedPromise = this.newPromise();
         combinedPromise.addListener(future -> super.onCloseTriggered(promise));
         combiner.finish(combinedPromise);
+    }
+
+    private static Throwable appendFailure(Throwable existing, Throwable additional) {
+        if (existing == null) {
+            return additional;
+        }
+        existing.addSuppressed(additional);
+        return existing;
     }
 
     public boolean tryBlockAddress(InetSocketAddress address, long time, TimeUnit unit) {

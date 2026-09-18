@@ -44,10 +44,11 @@ public class FastBinaryMinHeap<E> extends AbstractReferenceCounted implements It
         this.heap[0] = SUPREMUM;
     }
 
-    private static Entry newEntry(Object element, long weight) {
+    private static Entry newEntry(Object element, long weight, int priority) {
         Entry entry = RECYCLER.get();
         entry.element = element;
         entry.weight = weight;
+        entry.priority = priority;
 
         return entry;
     }
@@ -64,9 +65,13 @@ public class FastBinaryMinHeap<E> extends AbstractReferenceCounted implements It
     }
 
     public void insert(long weight, E element) {
+        this.insert(weight, 0, element);
+    }
+
+    public void insert(long weight, int priority, E element) {
         Objects.requireNonNull(element, "element");
         this.ensureCapacity(this.size + 1);
-        this.insert0(weight, element);
+        this.insert0(weight, priority, element);
     }
 
     private void ensureCapacity(int size) {
@@ -82,7 +87,21 @@ public class FastBinaryMinHeap<E> extends AbstractReferenceCounted implements It
         return entry != null ? (E) entry.element : null;
     }
 
-    private void insert0(long weight, E element) {
+    public long peekWeight() {
+        if (this.size == 0) {
+            throw new NoSuchElementException("Heap is empty");
+        }
+        return this.heap[1].weight;
+    }
+
+    public int peekPriority() {
+        if (this.size == 0) {
+            throw new NoSuchElementException("Heap is empty");
+        }
+        return this.heap[1].priority;
+    }
+
+    private void insert0(long weight, int priority, E element) {
         int hole = ++this.size;
         int pred = hole >> 1;
         long predWeight = this.heap[pred].weight;
@@ -94,39 +113,21 @@ public class FastBinaryMinHeap<E> extends AbstractReferenceCounted implements It
             predWeight = this.heap[pred].weight;
         }
 
-        this.heap[hole] = newEntry(element, weight);
+        this.heap[hole] = newEntry(element, weight, priority);
     }
 
     public void insertSeries(long weight, E[] elements) {
+        this.insertSeries(weight, 0, elements);
+    }
+
+    public void insertSeries(long weight, int priority, E[] elements) {
         Objects.requireNonNull(elements, "elements");
         if (elements.length == 0) return;
 
         this.ensureCapacity(this.size + elements.length);
-
-        // Try and optimize insertion.
-        boolean optimized = this.size == 0;
-        if (!optimized) {
-            optimized = true;
-            for (int parentIdx = 0, currentIdx = this.size; parentIdx < currentIdx; parentIdx++) {
-                if (weight < this.heap[parentIdx].weight) {
-                    optimized = false;
-                    break;
-                }
-            }
-        }
-
-        if (optimized) {
-            // Parents are all less than series weight so we can directly insert.
-            for (E element : elements) {
-                Objects.requireNonNull(element, "element");
-
-                this.heap[++this.size] = newEntry(element, weight);
-            }
-        } else {
-            for (E element : elements) {
-                Objects.requireNonNull(element, "element");
-                this.insert0(weight, element);
-            }
+        for (E element : elements) {
+            Objects.requireNonNull(element, "element");
+            this.insert0(weight, priority, element);
         }
     }
 
@@ -196,9 +197,7 @@ public class FastBinaryMinHeap<E> extends AbstractReferenceCounted implements It
     @Override
     protected void deallocate() {
         while (this.size > 0) {
-            Entry entry = this.heap[1];
             this.remove();
-            entry.release();
         }
     }
 
@@ -216,6 +215,7 @@ public class FastBinaryMinHeap<E> extends AbstractReferenceCounted implements It
         private final ObjectPool.Handle<Entry> handle;
         private Object element;
         private long weight;
+        private int priority;
 
         private Entry(long weight) {
             this.weight = weight;
@@ -232,6 +232,7 @@ public class FastBinaryMinHeap<E> extends AbstractReferenceCounted implements It
             if (handle == null) return;
             this.element = null;
             this.weight = 0;
+            this.priority = 0;
             this.handle.recycle(this);
         }
 

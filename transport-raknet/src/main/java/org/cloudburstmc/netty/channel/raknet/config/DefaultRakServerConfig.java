@@ -77,7 +77,7 @@ public class DefaultRakServerConfig extends DefaultChannelConfig implements RakS
         return getOptions(
                 super.getOptions(),
                 RakChannelOption.RAK_GUID, RakChannelOption.RAK_MAX_CHANNELS, RakChannelOption.RAK_MAX_CONNECTIONS, RakChannelOption.RAK_SUPPORTED_PROTOCOLS, RakChannelOption.RAK_UNCONNECTED_MAGIC,
-                RakChannelOption.RAK_ADVERTISEMENT, RakChannelOption.RAK_HANDLE_PING, RakChannelOption.RAK_PACKET_LIMIT, RakChannelOption.RAK_GLOBAL_PACKET_LIMIT, RakChannelOption.RAK_SERVER_METRICS, 
+                RakChannelOption.RAK_ADVERTISEMENT, RakChannelOption.RAK_HANDLE_PING, RakChannelOption.RAK_PACKET_LIMIT, RakChannelOption.RAK_GLOBAL_PACKET_LIMIT, RakChannelOption.RAK_SERVER_METRICS,
                 RakChannelOption.RAK_IP_DONT_FRAGMENT, RakChannelOption.RAK_SERVER_COOKIE_MODE, RakChannelOption.RAK_SERVER_COOKIE_SECRET, RakChannelOption.RAK_PROXY_PROTOCOL, RakChannelOption.RAK_THROTTLE);
     }
 

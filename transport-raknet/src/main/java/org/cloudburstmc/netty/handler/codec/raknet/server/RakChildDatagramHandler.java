@@ -22,8 +22,6 @@ import io.netty.channel.socket.DatagramPacket;
 import org.cloudburstmc.netty.channel.raknet.RakChildChannel;
 import org.cloudburstmc.netty.channel.raknet.config.RakChannelMetrics;
 
-import java.nio.channels.ClosedChannelException;
-
 public class RakChildDatagramHandler extends ChannelOutboundHandlerAdapter {
 
     public static final String NAME = "rak-child-datagram-handler";
@@ -54,12 +52,7 @@ public class RakChildDatagramHandler extends ChannelOutboundHandlerAdapter {
 
         Channel parent = this.channel.parent().parent();
 
-        parent.write(datagram).addListener((ChannelFuture future) -> {
-            if (!future.isSuccess() && !(future.cause() instanceof ClosedChannelException)) {
-                this.channel.pipeline().fireExceptionCaught(future.cause());
-                this.channel.close();
-            }
-        });
+        parent.write(datagram, parent.voidPromise());
     }
 
     @Override
