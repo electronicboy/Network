@@ -117,6 +117,19 @@ final class RakModelCongestionController {
      */
     private long measuredAckCount;
     private long appLimitedAckCount;
+    /**
+     * Delivered-byte mark that the application-limited condition runs until, or 0 when the flow is
+     * not application limited. Set when the application runs dry with room still left in the
+     * window, and cleared once delivery passes the mark - which is the point at which every
+     * datagram sent during the dry spell has been accounted for.
+     *
+     * <p>The latch is the whole point. Asking "is the send queue empty right now" once per
+     * datagram answers a different question: in a burst of {@code b} datagrams only the last one
+     * finds the queue empty, so the leading {@code b - 1} are recorded as genuine measurements of
+     * the path when they only ever measured how much the application handed over. Their samples
+     * then pull the windowed maximum down to the application's offered rate.</p>
+     */
+    private long appLimitedUntilDelivered;
     private long roundDeliveredPackets;
     private long roundLostPackets;
     private long roundDeliveredBytes;
@@ -197,10 +210,31 @@ final class RakModelCongestionController {
         return Math.max(1L, (long) Math.ceil((size - this.pacingTokens) / this.pacingRateBytesPerMillis()));
     }
 
-    void onPacketSent(RakDatagramPacket datagram, long nowMillis, int bytesInFlight, boolean appLimited) {
+    /**
+     * Applies the application-limited condition for a datagram about to be sent and reports whether
+     * it is covered by one.
+     *
+     * <p>Two things have to hold before the flow counts as application limited: the application has
+     * nothing further queued, and the window still had room, so the send rate was the
+     * application's choice rather than a limit this controller imposed. Once both hold the
+     * condition is latched to a delivered-byte mark and every datagram sent until delivery passes
+     * that mark inherits it, because those are exactly the datagrams whose in-flight count was
+     * decided by the dry spell.</p>
+     */
+    private boolean trackApplicationLimited(boolean applicationDrained, int bytesInFlight) {
+        if (applicationDrained && bytesInFlight <= this.cwnd) {
+            this.appLimitedUntilDelivered = Math.max(1L, this.deliveredBytes + bytesInFlight);
+        }
+        return this.appLimitedUntilDelivered != 0L;
+    }
+
+    void onPacketSent(RakDatagramPacket datagram, long nowMillis, int bytesInFlight,
+                      boolean applicationDrained) {
         this.refillPacingTokens(nowMillis);
         this.pacingTokens = Math.max(0D, this.pacingTokens - datagram.getSize());
-        this.continuouslyBacklogged = !appLimited;
+        // Pacing burst credit tracks the instantaneous condition, not the latched one.
+        this.continuouslyBacklogged = !applicationDrained;
+        boolean appLimited = this.trackApplicationLimited(applicationDrained, bytesInFlight);
 
         if (bytesInFlight <= datagram.getSize()) {
             this.firstSendTimeMillis = nowMillis;
@@ -214,10 +248,12 @@ final class RakModelCongestionController {
         this.onUnreliablePacketSent(size, nowMillis, size, false);
     }
 
-    DatagramSample onUnreliablePacketSent(int size, long nowMillis, int bytesInFlight, boolean appLimited) {
+    DatagramSample onUnreliablePacketSent(int size, long nowMillis, int bytesInFlight,
+                                          boolean applicationDrained) {
         this.refillPacingTokens(nowMillis);
         this.pacingTokens = Math.max(0D, this.pacingTokens - size);
-        this.continuouslyBacklogged = !appLimited;
+        this.continuouslyBacklogged = !applicationDrained;
+        boolean appLimited = this.trackApplicationLimited(applicationDrained, bytesInFlight);
         if (bytesInFlight <= size) {
             this.firstSendTimeMillis = nowMillis;
             this.deliveredTimeMillis = nowMillis;
@@ -228,7 +264,7 @@ final class RakModelCongestionController {
 
     UnreliableSendState captureUnreliableSendState() {
         return new UnreliableSendState(this.pacingTokens, this.pacingUpdatedAtMillis, this.firstSendTimeMillis,
-                this.deliveredTimeMillis, this.continuouslyBacklogged);
+                this.deliveredTimeMillis, this.continuouslyBacklogged, this.appLimitedUntilDelivered);
     }
 
     void restoreUnreliableSendState(UnreliableSendState state) {
@@ -237,6 +273,7 @@ final class RakModelCongestionController {
         this.firstSendTimeMillis = state.firstSendTimeMillis;
         this.deliveredTimeMillis = state.deliveredTimeMillis;
         this.continuouslyBacklogged = state.continuouslyBacklogged;
+        this.appLimitedUntilDelivered = state.appLimitedUntilDelivered;
     }
 
     void onAcknowledged(RakDatagramPacket datagram, long nowMillis, long rttSampleMillis,
@@ -277,6 +314,9 @@ final class RakModelCongestionController {
         long sendElapsed = modelSendTime - packetFirstSendTime;
         this.deliveredBytes += acknowledgedBytes;
         this.deliveredTimeMillis = nowMillis;
+        if (this.appLimitedUntilDelivered != 0L && this.deliveredBytes > this.appLimitedUntilDelivered) {
+            this.appLimitedUntilDelivered = 0L;
+        }
 
         if (appLimited) {
             this.appLimitedAckCount = saturatingAdd(this.appLimitedAckCount, 1L);
@@ -1110,6 +1150,7 @@ final class RakModelCongestionController {
         state.modelAppLimited = datagram.isModelAppLimited();
         state.modelLossClassified = datagram.isModelLossClassified();
         state.continuouslyBacklogged = this.continuouslyBacklogged;
+        state.appLimitedUntilDelivered = this.appLimitedUntilDelivered;
     }
 
     void restoreSendState(RakDatagramPacket datagram, SendState state) {
@@ -1118,6 +1159,7 @@ final class RakModelCongestionController {
         this.firstSendTimeMillis = state.firstSendTimeMillis;
         this.deliveredTimeMillis = state.deliveredTimeMillis;
         this.continuouslyBacklogged = state.continuouslyBacklogged;
+        this.appLimitedUntilDelivered = state.appLimitedUntilDelivered;
         if (state.modelSampleValid) {
             datagram.setModelSendState(state.deliveredBytesAtSend, state.deliveredTimeAtSend,
                     state.packetFirstSendTime, state.modelSendTime, state.modelTxInFlight, state.modelAppLimited);
@@ -1229,6 +1271,7 @@ final class RakModelCongestionController {
         private boolean modelAppLimited;
         private boolean modelLossClassified;
         private boolean continuouslyBacklogged;
+        private long appLimitedUntilDelivered;
 
         SendState() {
         }
@@ -1269,14 +1312,17 @@ final class RakModelCongestionController {
         private final long firstSendTimeMillis;
         private final long deliveredTimeMillis;
         private final boolean continuouslyBacklogged;
+        private final long appLimitedUntilDelivered;
 
         private UnreliableSendState(double pacingTokens, long pacingUpdatedAtMillis, long firstSendTimeMillis,
-                                    long deliveredTimeMillis, boolean continuouslyBacklogged) {
+                                    long deliveredTimeMillis, boolean continuouslyBacklogged,
+                                    long appLimitedUntilDelivered) {
             this.pacingTokens = pacingTokens;
             this.pacingUpdatedAtMillis = pacingUpdatedAtMillis;
             this.firstSendTimeMillis = firstSendTimeMillis;
             this.deliveredTimeMillis = deliveredTimeMillis;
             this.continuouslyBacklogged = continuouslyBacklogged;
+            this.appLimitedUntilDelivered = appLimitedUntilDelivered;
         }
     }
 }
