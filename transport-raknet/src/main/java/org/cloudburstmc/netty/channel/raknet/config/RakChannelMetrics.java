@@ -162,6 +162,26 @@ public interface RakChannelMetrics {
     }
 
     /**
+     * As above, plus the split of acknowledgements into those that measured the path and those that
+     * described an application-limited flight. Only the former may raise the delivery-rate estimate,
+     * so the ratio between them determines whether a session that goes quiet keeps what it learned or
+     * replaces it with samples of a rate the application chose.
+     *
+     * @param measuredAckCount cumulative acknowledgements eligible to raise the estimate
+     * @param appLimitedAckCount cumulative acknowledgements excluded as application-limited
+     */
+    default void rakCongestionModelState(long observedAtMillis, double estimatedDeliveryRateBytesPerSecond,
+                                         double pacingRateBytesPerSecond, long minimumRttMillis,
+                                         double recentLossRate, long packetRound, boolean startup,
+                                         boolean persistentCongestion, long hardLossResponseCount,
+                                         long delayLossResponseCount, long measuredAckCount,
+                                         long appLimitedAckCount) {
+        this.rakCongestionModelState(observedAtMillis, estimatedDeliveryRateBytesPerSecond,
+                pacingRateBytesPerSecond, minimumRttMillis, recentLossRate, packetRound, startup,
+                persistentCongestion, hardLossResponseCount, delayLossResponseCount);
+    }
+
+    /**
      * Invoked after the terminal recovery snapshot when the session closes. Gauge exporters should remove any
      * channel-local state retained for this session.
      *

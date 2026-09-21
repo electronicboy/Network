@@ -109,6 +109,14 @@ final class RakModelCongestionController {
     private long nextRoundDelivered;
     private long roundCount;
     private int bandwidthFilterIndex;
+    /**
+     * How many acknowledgements arrived describing a flight the application had filled, versus one it
+     * had not. Only the first kind may raise the bandwidth estimate, so the split between them decides
+     * whether an idle session can keep what it learned. Exported so that can be observed in production
+     * rather than reasoned about from the send path.
+     */
+    private long measuredAckCount;
+    private long appLimitedAckCount;
     private long roundDeliveredPackets;
     private long roundLostPackets;
     private long roundDeliveredBytes;
@@ -269,6 +277,12 @@ final class RakModelCongestionController {
         long sendElapsed = modelSendTime - packetFirstSendTime;
         this.deliveredBytes += acknowledgedBytes;
         this.deliveredTimeMillis = nowMillis;
+
+        if (appLimited) {
+            this.appLimitedAckCount = saturatingAdd(this.appLimitedAckCount, 1L);
+        } else {
+            this.measuredAckCount = saturatingAdd(this.measuredAckCount, 1L);
+        }
 
         boolean newRound = priorDelivered >= this.nextRoundDelivered;
         long completedRoundDeliveredBytes = 0L;
@@ -1167,6 +1181,14 @@ final class RakModelCongestionController {
 
     double getRecentLossRate() {
         return this.recentLossRate;
+    }
+
+    long getMeasuredAckCount() {
+        return this.measuredAckCount;
+    }
+
+    long getAppLimitedAckCount() {
+        return this.appLimitedAckCount;
     }
 
     long getRoundCount() {

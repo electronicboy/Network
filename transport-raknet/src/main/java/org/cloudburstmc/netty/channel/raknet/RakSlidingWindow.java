@@ -474,6 +474,14 @@ public class RakSlidingWindow {
         return this.modelController.isStartup();
     }
 
+    public long getModelMeasuredAckCount() {
+        return this.modelController.getMeasuredAckCount();
+    }
+
+    public long getModelAppLimitedAckCount() {
+        return this.modelController.getAppLimitedAckCount();
+    }
+
     public long getModelRoundCount() {
         return this.modelController.getRoundCount();
     }

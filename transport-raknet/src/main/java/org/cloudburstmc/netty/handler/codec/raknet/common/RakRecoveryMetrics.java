@@ -147,7 +147,8 @@ final class RakRecoveryMetrics {
                 slidingWindow.getModelMinimumRttMillis(), slidingWindow.getModelRecentLossRate(),
                 slidingWindow.getModelRoundCount(), slidingWindow.isModelStartup(),
                 slidingWindow.isModelPersistentCongestion(), slidingWindow.getModelHardLossResponseCount(),
-                slidingWindow.getModelDelayLossResponseCount());
+                slidingWindow.getModelDelayLossResponseCount(), slidingWindow.getModelMeasuredAckCount(),
+                slidingWindow.getModelAppLimitedAckCount());
     }
 
     static final class SendState {
