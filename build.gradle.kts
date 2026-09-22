@@ -24,7 +24,7 @@ subprojects {
     apply(plugin = "maven-publish")
     apply(plugin = "signing")
 
-    group = "org.cloudburstmc.netty"
+    group = "shane.raknet.temp"
     version = networkVersion
 
     repositories {
