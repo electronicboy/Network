@@ -151,6 +151,11 @@ public class RakSlidingWindow {
     }
 
     /** Tracks a new reliable send and whether the sender had no further work available. */
+    public void onReliableSend(RakDatagramPacket datagram, boolean appLimited, int queuedBytes) {
+        this.modelController.setApplicationQueuedBytes(queuedBytes);
+        this.onReliableSend(datagram, appLimited);
+    }
+
     public void onReliableSend(RakDatagramPacket datagram, boolean appLimited) {
         if (datagram.isReliableOutstanding()) {
             return;

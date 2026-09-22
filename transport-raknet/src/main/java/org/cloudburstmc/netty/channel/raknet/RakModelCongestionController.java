@@ -59,6 +59,14 @@ final class RakModelCongestionController {
     private static final long PATH_COOLDOWN_MAX_MILLIS = 1_000L;
     private static final int PATH_MAX_ATTEMPTS = 3;
     private static final int STARTUP_MINIMUM_ROUND_MTUS = 4;
+    /**
+     * Rounds of unbroken application backlog after which a settled sender goes back to probing.
+     * A session that genuinely has nothing to send runs its queue dry constantly, so eight rounds
+     * without a single dry moment is already unusual for interactive traffic.
+     */
+    private static final int BACKLOG_RESTART_ROUNDS = 8;
+    /** Rounds to wait before a second backlog-triggered restart, so this cannot oscillate. */
+    private static final long BACKLOG_RESTART_COOLDOWN_ROUNDS = 64L;
     private static final int LOSS_BUCKET_MINIMUM_PACKETS = 64;
     private static final int DELAY_LOSS_MINIMUM_PACKETS = 128;
     private static final int DELAY_CLEAR_BUCKET_MINIMUM_PACKETS = 256;
@@ -117,6 +125,11 @@ final class RakModelCongestionController {
      */
     private long measuredAckCount;
     private long appLimitedAckCount;
+    /** Round in which the application last ran out of data, and the last backlog-triggered restart. */
+    private long applicationDrainedRound;
+    private long backlogRestartRound;
+    /** Bytes the application still has queued behind the last datagram handed to this controller. */
+    private int applicationQueuedBytes;
     private long roundDeliveredPackets;
     private long roundLostPackets;
     private long roundDeliveredBytes;
@@ -197,10 +210,23 @@ final class RakModelCongestionController {
         return Math.max(1L, (long) Math.ceil((size - this.pacingTokens) / this.pacingRateBytesPerMillis()));
     }
 
+    /**
+     * Reports how much the application still has waiting behind what it just handed over. The
+     * controller cannot see the send queue, and "has not run dry" on its own does not separate a
+     * session held up by a small window from one trickling a packet at a time - both never report
+     * themselves drained, and only the first is worth rescuing.
+     */
+    void setApplicationQueuedBytes(int queuedBytes) {
+        this.applicationQueuedBytes = Math.max(0, queuedBytes);
+    }
+
     void onPacketSent(RakDatagramPacket datagram, long nowMillis, int bytesInFlight, boolean appLimited) {
         this.refillPacingTokens(nowMillis);
         this.pacingTokens = Math.max(0D, this.pacingTokens - datagram.getSize());
         this.continuouslyBacklogged = !appLimited;
+        if (appLimited) {
+            this.applicationDrainedRound = this.roundCount;
+        }
 
         if (bytesInFlight <= datagram.getSize()) {
             this.firstSendTimeMillis = nowMillis;
@@ -218,6 +244,9 @@ final class RakModelCongestionController {
         this.refillPacingTokens(nowMillis);
         this.pacingTokens = Math.max(0D, this.pacingTokens - size);
         this.continuouslyBacklogged = !appLimited;
+        if (appLimited) {
+            this.applicationDrainedRound = this.roundCount;
+        }
         if (bytesInFlight <= size) {
             this.firstSendTimeMillis = nowMillis;
             this.deliveredTimeMillis = nowMillis;
@@ -318,6 +347,7 @@ final class RakModelCongestionController {
         }
 
         this.updateFullBandwidth(newRound, completedRoundDeliveredBytes);
+        this.maybeRestartForBacklog(newRound);
         this.updateCongestionWindow(acknowledgedBytes);
         this.firstSendTimeMillis = modelSendTime;
     }
@@ -1002,6 +1032,47 @@ final class RakModelCongestionController {
         } else if (++this.fullBandwidthRounds >= FULL_BANDWIDTH_ROUNDS) {
             this.startup = false;
         }
+    }
+
+    /**
+     * Sends a settled sender back to startup when it has been continuously backlogged and is not
+     * recovering on its own.
+     *
+     * <p>Every other route back into startup is triggered by loss or by a change of path, so a
+     * session that quietly ends up estimating far below what the path will carry has none: it
+     * cruises at a unit pacing gain, which is a fixed point. Pacing at exactly the estimate means
+     * the delivery it measures *is* the estimate, so the windowed maximum learns nothing and the
+     * only growth left is the in-flight headroom from {@code CWND_GAIN}. Measured against a real
+     * session that lost eight and a half times its estimate in one second with no loss at all,
+     * that is several seconds of queued audio and movement before it is back.</p>
+     *
+     * <p>The estimate is deliberately kept rather than cleared the way persistent congestion
+     * clears it - the point is to probe upwards from what is already known, not to rediscover the
+     * path from nothing. A false positive is cheap: a sender that really is at capacity shows no
+     * growth for {@link #FULL_BANDWIDTH_ROUNDS} rounds and startup ends itself.</p>
+     */
+    private void maybeRestartForBacklog(boolean newRound) {
+        if (!newRound || this.startup || this.maxBandwidthBytesPerMillis <= 0D) {
+            return;
+        }
+        // What makes the difference is depth of queue, not merely never running dry: the session
+        // worth rescuing has more waiting than a whole window can carry, so this controller is
+        // demonstrably the limit on it. A trickling sender has nothing queued and is left alone.
+        if (this.applicationQueuedBytes <= this.cwnd) {
+            return;
+        }
+        // Loss has its own recovery path and its own opinion about the window; do not race it.
+        if (this.lossState != LossState.ARMED || this.recentLossRate > 0D) {
+            return;
+        }
+        if (this.roundCount - this.applicationDrainedRound < BACKLOG_RESTART_ROUNDS
+                || this.roundCount - this.backlogRestartRound < BACKLOG_RESTART_COOLDOWN_ROUNDS) {
+            return;
+        }
+        this.backlogRestartRound = this.roundCount;
+        this.startup = true;
+        this.fullBandwidthBytesPerMillis = 0D;
+        this.fullBandwidthRounds = 0;
     }
 
     private void updateCongestionWindow(int acknowledgedBytes) {

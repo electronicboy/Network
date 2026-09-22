@@ -1080,7 +1080,8 @@ public class RakSessionCodec extends ChannelDuplexHandler {
                 reliable = true;
                 datagram.setNextSend(time + this.slidingWindow.getRtoForRetransmission());
                 if (oldIndex == -1) {
-                    this.slidingWindow.onReliableSend(datagram, this.isModelAppLimited());
+                    this.slidingWindow.onReliableSend(datagram, this.isModelAppLimited(),
+                            this.queuedBytes);
                 }
                 sent.put(datagram.getSequenceIndex(), datagram.retain()); // Keep for resending
                 if (oldIndex == -1) {
