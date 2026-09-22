@@ -64,6 +64,20 @@ final class RakModelCongestionController {
      * A session that genuinely has nothing to send runs its queue dry constantly, so eight rounds
      * without a single dry moment is already unusual for interactive traffic.
      */
+    /**
+     * Rate the protocol assumes a player's connection can carry, in bytes per millisecond
+     * (1.5 Mbit/s). A session that spends a few minutes in a game after its join burst has
+     * nothing left to measure with, and the estimate decays toward whatever trickle of movement
+     * and chat it happens to carry. The next burst - a server switch - then has to drain through
+     * whatever that decayed to, which is how 400 kB of queued work became a five second stall.
+     *
+     * <p>Held as a rate rather than a window on purpose. Achievable throughput is
+     * {@code cwnd / minRTT}, and cwnd is {@code CWND_GAIN x rate x minRTT}, so a rate floor is
+     * worth the same to every player. The existing {@link #minimumCwnd} floor of two MTUs is not:
+     * it implies 4.4 Mbit/s at a 5 ms path and 0.22 Mbit/s at a 100 ms one, which is backwards,
+     * since it is the distant player who can least afford to rediscover the path.</p>
+     */
+    private static final double MINIMUM_DELIVERY_RATE_BYTES_PER_MILLIS = 187.5D;
     private static final int BACKLOG_RESTART_ROUNDS = 8;
     /** Rounds to wait before a second backlog-triggered restart, so this cannot oscillate. */
     private static final long BACKLOG_RESTART_COOLDOWN_ROUNDS = 64L;
@@ -130,6 +144,8 @@ final class RakModelCongestionController {
     private long backlogRestartRound;
     /** Bytes the application still has queued behind the last datagram handed to this controller. */
     private int applicationQueuedBytes;
+    /** Best delivery rate this session has ever actually achieved, in bytes per millisecond. */
+    private double peakBandwidthBytesPerMillis;
     private long roundDeliveredPackets;
     private long roundLostPackets;
     private long roundDeliveredBytes;
@@ -651,6 +667,7 @@ final class RakModelCongestionController {
             maximum = Math.max(maximum, sample);
         }
         this.maxBandwidthBytesPerMillis = maximum;
+        this.peakBandwidthBytesPerMillis = Math.max(this.peakBandwidthBytesPerMillis, maximum);
     }
 
     private void updateMinimumRtt(long nowMillis, long rttSampleMillis, int txInFlight,
@@ -1080,8 +1097,8 @@ final class RakModelCongestionController {
             return;
         }
         double target = Math.max(this.minimumCwnd, Math.min(this.maximumCwnd,
-                this.maxBandwidthBytesPerMillis * Math.max(this.minimumRttMillis, this.sendQuantumMillis)
-                        * CWND_GAIN));
+                this.effectiveBandwidthBytesPerMillis()
+                        * Math.max(this.minimumRttMillis, this.sendQuantumMillis) * CWND_GAIN));
         if (this.lossState == LossState.HOLD && this.lossHoldKind == LossHoldKind.DELAY
                 && Double.isFinite(this.inflightLimit)) {
             // DELAY installs one explicit beta-reduced flight for the continuing congestion epoch. Letting the
@@ -1123,10 +1140,37 @@ final class RakModelCongestionController {
         }
     }
 
+    /**
+     * The delivery rate the window and pacer are allowed to act on, which is the measured rate
+     * lifted to the protocol's assumed minimum while the path has shown it can carry it.
+     *
+     * <p>The floor is applied here, at the point of use, and never to the bandwidth filter
+     * itself: the measurement stays honest, so loss response and probing still reason from what
+     * the path actually did. It is also withdrawn the moment loss is in play, because a session
+     * that is losing packets has told us it cannot carry the assumed rate and must be believed
+     * over the assumption.</p>
+     */
+    private double effectiveBandwidthBytesPerMillis() {
+        // Startup has its own standards-sized initial window and its own reasons for holding it,
+        // and a loss epoch has already been told what the path will take. The floor exists for
+        // the case neither covers: a settled session whose estimate has decayed in quiet.
+        if (this.startup || this.lossState != LossState.ARMED || this.recentLossRate > 0D) {
+            return this.maxBandwidthBytesPerMillis;
+        }
+        // Never assert more than this session has actually achieved. The assumption is that a
+        // player's connection can carry the protocol's rate, and a session that has demonstrated
+        // it is entitled to be held there when it later goes quiet. A session that never once
+        // reached it has told us the assumption does not hold for this player, and lifting its
+        // window to a rate the path has never carried only builds a queue in the network - which
+        // is measurably worse than leaving it alone.
+        double floor = Math.min(MINIMUM_DELIVERY_RATE_BYTES_PER_MILLIS, this.peakBandwidthBytesPerMillis);
+        return Math.max(this.maxBandwidthBytesPerMillis, floor);
+    }
+
     private double pacingRateBytesPerMillis() {
         double rate;
         if (this.maxBandwidthBytesPerMillis > 0D) {
-            rate = this.maxBandwidthBytesPerMillis
+            rate = this.effectiveBandwidthBytesPerMillis()
                     * (this.startup ? STARTUP_PACING_GAIN : this.steadyPacingGain());
         } else {
             rate = this.cwnd / INITIAL_RTT_MILLIS * STARTUP_PACING_GAIN;
